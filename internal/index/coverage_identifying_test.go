@@ -16,16 +16,12 @@ import "testing"
 func TestCoverageIsPaidOnTheWordsThatIdentify(t *testing.T) {
 	// Session 1 covers three ordinary words and nothing else; session 2 carries
 	// the one word that identifies.
-	all := map[uint32]int{1: 3, 2: 1}
-	identifying := map[uint32]int{2: 1}
-
-	got := coverageCounts(all, identifying, 1)
-	if got[1] != 0 {
+	if got := coverageCount(3, 0, 1); got != 0 {
 		t.Errorf("a session covering only ordinary words was still paid for "+
-			"covering %d of them", got[1])
+			"covering %d of them", got)
 	}
-	if got[2] != 1 {
-		t.Errorf("the session carrying the identifying word lost its coverage: %d", got[2])
+	if got := coverageCount(1, 1, 1); got != 1 {
+		t.Errorf("the session carrying the identifying word lost its coverage: %d", got)
 	}
 }
 
@@ -33,10 +29,12 @@ func TestCoverageIsPaidOnTheWordsThatIdentify(t *testing.T) {
 // counting them is all there is: dropping to zero coverage everywhere would
 // leave the ranking with one less signal exactly where it is thinnest.
 func TestCoverageKeepsTheGenerousCountWhenNothingIdentifies(t *testing.T) {
-	all := map[uint32]int{1: 3, 2: 2}
-	got := coverageCounts(all, map[uint32]int{}, 0)
-	if got[1] != 3 || got[2] != 2 {
+	if got := coverageCount(3, 0, 0); got != 3 {
 		t.Errorf("the generous count was dropped on a query with no identifying "+
-			"word: %v", got)
+			"word: %d", got)
+	}
+	if got := coverageCount(2, 0, 0); got != 2 {
+		t.Errorf("the generous count was dropped on a query with no identifying "+
+			"word: %d", got)
 	}
 }

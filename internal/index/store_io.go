@@ -1111,22 +1111,24 @@ func readBucketFile(p string) (map[string][]posting, error) {
 
 // readBucketFileToken reads one token's postings from one postings file.
 func readBucketFileToken(p, tok string) ([]posting, error) {
-	entries, f, err := openBucketDir(p)
+	f, err := openIndexFile(p)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	for _, e := range entries {
-		if e.tok != tok {
-			continue
-		}
-		b := make([]byte, e.n)
-		if _, err := f.ReadAt(b, int64(e.off)); err != nil { //nolint:gosec // offsets are checked against the bucket size on open
-			return nil, err
-		}
-		return decodePostingBlock(b)
+	d, err := bucketDirOf(p, f)
+	if err != nil {
+		return nil, err
 	}
-	return nil, nil
+	e, ok := d.find(tok)
+	if !ok {
+		return nil, nil
+	}
+	b := make([]byte, e.n)
+	if _, err := f.ReadAt(b, int64(e.off)); err != nil { //nolint:gosec // offsets are checked against the bucket size on open
+		return nil, err
+	}
+	return decodePostingBlock(b)
 }
 
 // bucketDirReads counts bucket directories read off disk, for the test that
@@ -1134,44 +1136,51 @@ func readBucketFileToken(p, tok string) ([]posting, error) {
 var bucketDirReads atomic.Int64
 
 func openBucketDir(p string) ([]bucketEntry, *os.File, error) {
-	bucketDirReads.Add(1)
 	f, err := openIndexFile(p)
 	if err != nil {
 		return nil, nil, err
 	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, err
+	}
+	entries, err := readBucketDir(f, fi)
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, err
+	}
+	return entries, f, nil
+}
+
+// readBucketDir parses the directory of the bucket file f, just opened, which
+// fi describes. f is left open.
+func readBucketDir(f *os.File, fi os.FileInfo) ([]bucketEntry, error) {
+	bucketDirReads.Add(1)
 	r := bufio.NewReader(f)
 	magic := make([]byte, len(bucketMagic))
-	if _, err = io.ReadFull(r, magic); err != nil {
-		_ = f.Close()
-		return nil, nil, fmt.Errorf("%w: %w", errCorruptIndex, err)
+	if _, err := io.ReadFull(r, magic); err != nil {
+		return nil, fmt.Errorf("%w: %w", errCorruptIndex, err)
 	}
 	if !bytes.Equal(magic, bucketMagic) {
-		_ = f.Close()
 		// Named for what it is. The magic moves when the posting format
 		// changes, and every reader of an index written by another version
 		// lands here — telling them the index is damaged sends them looking
 		// for a disk fault they do not have (#492).
-		return nil, nil, fmt.Errorf("%w: %s", errCorruptIndex, wrongBucketFormat(magic))
+		return nil, fmt.Errorf("%w: %s", errCorruptIndex, wrongBucketFormat(magic))
 	}
 	count, err := binary.ReadUvarint(r)
 	if err != nil {
-		_ = f.Close()
-		return nil, nil, fmt.Errorf("%w: %w", errCorruptIndex, err)
+		return nil, fmt.Errorf("%w: %w", errCorruptIndex, err)
 	}
 	// count and the token lengths below come straight off disk. A truncated
 	// file, or one written by a different index layout, can name a size no
 	// allocation could satisfy — and make() panics on that rather than
 	// failing. Every other corruption here is recoverable, so bound both
 	// against the file: no entry occupies fewer than two bytes.
-	fi, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return nil, nil, err
-	}
 	fileSize := uint64(fi.Size()) //nolint:gosec // file sizes are non-negative
 	if count > fileSize/2 {
-		_ = f.Close()
-		return nil, nil, fmt.Errorf("%w: bucket directory claims %d entries in %d bytes", errCorruptIndex, count, fileSize)
+		return nil, fmt.Errorf("%w: bucket directory claims %d entries in %d bytes", errCorruptIndex, count, fileSize)
 	}
 	entries := make([]bucketEntry, 0, count)
 	// Offsets are not stored; they are the running sum of the lengths, taken
@@ -1180,30 +1189,25 @@ func openBucketDir(p string) ([]bucketEntry, *os.File, error) {
 	for range count {
 		ln, err := binary.ReadUvarint(r)
 		if err != nil {
-			_ = f.Close()
-			return nil, nil, fmt.Errorf("%w: %w", errCorruptIndex, err)
+			return nil, fmt.Errorf("%w: %w", errCorruptIndex, err)
 		}
 		if ln > fileSize {
-			_ = f.Close()
-			return nil, nil, fmt.Errorf("%w: token length %d exceeds bucket size %d", errCorruptIndex, ln, fileSize)
+			return nil, fmt.Errorf("%w: token length %d exceeds bucket size %d", errCorruptIndex, ln, fileSize)
 		}
 		tb := make([]byte, ln)
 		if _, err = io.ReadFull(r, tb); err != nil {
-			_ = f.Close()
-			return nil, nil, fmt.Errorf("%w: %w", errCorruptIndex, err)
+			return nil, fmt.Errorf("%w: %w", errCorruptIndex, err)
 		}
 		size, err := binary.ReadUvarint(r)
 		if err != nil {
-			_ = f.Close()
-			return nil, nil, fmt.Errorf("%w: %w", errCorruptIndex, err)
+			return nil, fmt.Errorf("%w: %w", errCorruptIndex, err)
 		}
 		// MaxUint32 alone is not a bound: a bucket claiming four gigabytes for
 		// one token is an out-of-memory kill rather than a corrupt-index
 		// error, and the caller can recover from the latter. Postings live in
 		// this same file, so the file's own size is the real ceiling.
 		if size > math.MaxUint32 || size > fileSize {
-			_ = f.Close()
-			return nil, nil, fmt.Errorf("%w: posting block of %d bytes in a %d byte bucket", errCorruptIndex, size, fileSize)
+			return nil, fmt.Errorf("%w: posting block of %d bytes in a %d byte bucket", errCorruptIndex, size, fileSize)
 		}
 		dirLen += uint64(uvarintLen(ln)) + ln + uint64(uvarintLen(size)) //nolint:gosec // lengths are non-negative
 		entries = append(entries, bucketEntry{tok: string(tb), n: uint32(size)})
@@ -1213,7 +1217,7 @@ func openBucketDir(p string) ([]bucketEntry, *os.File, error) {
 		entries[i].off = pos
 		pos += uint64(entries[i].n)
 	}
-	return entries, f, nil
+	return entries, nil
 }
 
 // damagedOrOutdated names the two reasons an index cannot be read. A format
@@ -1321,7 +1325,15 @@ func decodePostingBlock(b []byte) ([]posting, error) {
 // the prefix coming back — an earlier version of this comment claimed two
 // callers did, and none does.
 func decodePostings(b []byte) []posting {
-	out := make([]posting, 0)
+	// Sized up front: a posting is two varints, and a varint ends on the one
+	// byte of it below 0x80. Grown by append, the slice cost twice its size.
+	ends := 0
+	for _, c := range b {
+		if c < 0x80 {
+			ends++
+		}
+	}
+	out := make([]posting, 0, ends/2)
 	var prev int64
 	var prevSid uint32
 	for len(b) > 0 {
@@ -1427,24 +1439,25 @@ func readGob(p string, v any) error {
 	return nil
 }
 
-// bucketReader memoizes parsed bucket directories for the span of one query.
-// A bucket's directory lists every token in that shard, and readBucketToken
-// re-read and re-parsed the whole thing per token. The relevance tier asks
+// bucketReader is one query's reads of the postings. The relevance tier asks
 // for every inflected form of a term, and those forms share their opening
-// runes — so they all hash to the same bucket and re-parsed the same
-// directory dozens of times per query. Only the directory is cached; the
-// file is reopened per read so a concurrent index swap is never blocked by a
-// held handle.
+// runes, so they all hash to the same bucket: each bucket's directory is
+// looked up once per query, and a form it does not list costs nothing more.
+// The directories themselves come from the process's cache (bucketDirOf). A
+// file is opened per read, never held, so a concurrent index swap is not
+// blocked by a handle.
 type bucketReader struct {
-	dir     string
-	entries map[string][]bucketEntry
+	dir string
+	// dirs is each file's directory as first looked up, nil for a file that
+	// was not there.
+	dirs map[string]*cachedBucketDir
 	// layers is each bucket's overlays as first looked up.
 	layers map[string][]string
 	dead   []int64
 }
 
 func newBucketReader(dir string) *bucketReader {
-	return &bucketReader{dir: dir, entries: map[string][]bucketEntry{}, layers: map[string][]string{}, dead: deadRecordsOf(dir)}
+	return &bucketReader{dir: dir, dirs: map[string]*cachedBucketDir{}, layers: map[string][]string{}, dead: deadRecordsOf(dir)}
 }
 
 // bucketBaseRead, when set, runs between a bucket's own postings and its
@@ -1485,41 +1498,52 @@ func (b *bucketReader) postings(tok string) ([]posting, error) {
 }
 
 func (b *bucketReader) filePostings(p, tok string) ([]posting, error) {
-	entries, cached := b.entries[p]
-	if !cached {
-		e, f, err := openBucketDir(p)
-		if err != nil {
+	d, seen := b.dirs[p]
+	var f *os.File
+	if !seen {
+		var err error
+		if f, err = openIndexFile(p); err != nil {
 			if os.IsNotExist(err) {
-				b.entries[p] = nil
+				b.dirs[p] = nil
 			}
 			return nil, err
 		}
-		_ = f.Close()
-		b.entries[p] = e
-		entries = e
-	} else if entries == nil {
+		defer func() { _ = f.Close() }()
+		if d, err = bucketDirOf(p, f); err != nil {
+			return nil, err
+		}
+		b.dirs[p] = d
+	} else if d == nil {
 		return nil, os.ErrNotExist
 	}
-	for _, e := range entries {
-		if e.tok != tok {
-			continue
-		}
-		f, err := openIndexFile(p)
-		if err != nil {
-			return nil, err
-		}
-		buf := make([]byte, e.n)
-		_, err = f.ReadAt(buf, int64(e.off)) //nolint:gosec // offsets are checked against the bucket size on open
-		_ = f.Close()
-		if err != nil {
-			return nil, err
-		}
-		return decodePostingBlock(buf)
+	if _, ok := d.find(tok); !ok {
+		return nil, nil
 	}
-	return nil, nil
+	if f == nil {
+		var err error
+		if f, err = openIndexFile(p); err != nil {
+			return nil, err
+		}
+		defer func() { _ = f.Close() }()
+		// The directory for the file open now, which a swap since the first
+		// look may have replaced.
+		if d, err = bucketDirOf(p, f); err != nil {
+			return nil, err
+		}
+		b.dirs[p] = d
+	}
+	e, ok := d.find(tok)
+	if !ok {
+		return nil, nil
+	}
+	buf := make([]byte, e.n)
+	if _, err := f.ReadAt(buf, int64(e.off)); err != nil { //nolint:gosec // offsets are checked against the bucket size on open
+		return nil, err
+	}
+	return decodePostingBlock(buf)
 }
 
-func (b *bucketReader) close() { b.entries = nil }
+func (b *bucketReader) close() { b.dirs = nil }
 
 // Coalescing bounds for eachRecordAt. A search over a common term resolves a
 // few thousand records that sit close together in write order — the median hole

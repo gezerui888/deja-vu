@@ -49,12 +49,7 @@ const (
 	LabelAgent       = "Report a subagent wrote (its words, not a record): "
 )
 
-var (
-	normWS  = regexp.MustCompile(`\s+`)
-	evNum   = regexp.MustCompile(`\d+(?:[.,]\d+)*`)
-	evIdent = regexp.MustCompile("`[^`]+`|[A-Za-z_][A-Za-z0-9_]*[._/-][A-Za-z0-9_./-]+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z][a-z]+[A-Z][A-Za-z0-9]*|[A-Z][A-Z0-9_]{2,}")
-	evWord  = regexp.MustCompile(`[\p{L}][\p{L}\p{N}_-]{3,}`)
-)
+var normWS = regexp.MustCompile(`\s+`)
 
 var stop = map[string]bool{"that": true, "this": true, "with": true, "from": true, "were": true, "have": true, "than": true,
 	"then": true, "there": true, "their": true, "which": true, "when": true, "what": true, "into": true, "only": true,
@@ -142,7 +137,37 @@ func RuleLike(s string) bool {
 	if t == "" || strings.HasSuffix(t, "?") {
 		return false
 	}
+	if isASCII(t) && !holdsRuleWord(strings.ToLower(t)) {
+		return false
+	}
 	return ruleRE.MatchString(t)
+}
+
+// ruleWords are what ruleRE needs to find in an ASCII text: each English
+// alternative holds one of them, and an ASCII text has nothing the Russian
+// ones or a case fold outside ASCII could match. Looking for them first spares
+// most messages the regexp, which was a few percent of a cold build.
+var ruleWords = []string{"rule", "always", "never", "every time", "each time", "whenever", "from now on",
+	"before ", "after ", "do not", "don't", "must", "make sure", "prefer", "instead of", "is not enough",
+	"not allowed", "policy"}
+
+// holdsRuleWord reports whether low, lowercased, holds one of ruleWords.
+func holdsRuleWord(low string) bool {
+	for _, w := range ruleWords {
+		if strings.Contains(low, w) {
+			return true
+		}
+	}
+	return false
+}
+
+func isASCII(s string) bool {
+	for i := range len(s) {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
 }
 
 // AddressesAgent reports text that instructs an AI reader: a rule and an agent
@@ -153,20 +178,20 @@ func AddressesAgent(s string) bool { return RuleLike(s) && agentReaderRE.MatchSt
 
 func tokens(s string) (strong, words []string) {
 	seen := map[string]bool{}
-	for _, m := range evIdent.FindAllString(s, -1) {
+	for _, m := range identMatches(s) {
 		m = strings.Trim(m, "`.,;:")
 		if len(m) >= 3 && !seen[strings.ToLower(m)] {
 			seen[strings.ToLower(m)] = true
 			strong = append(strong, m)
 		}
 	}
-	for _, m := range evNum.FindAllString(s, -1) {
+	for _, m := range numMatches(s) {
 		if !seen[m] {
 			seen[m] = true
 			strong = append(strong, m)
 		}
 	}
-	for _, m := range evWord.FindAllString(s, -1) {
+	for _, m := range wordMatches(s) {
 		l := strings.ToLower(m)
 		if stop[l] || seen[l] {
 			continue

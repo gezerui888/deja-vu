@@ -8,10 +8,18 @@ import (
 
 // relevanceAcc is what relevantMetasCounts collects term by term before it
 // ranks the sessions.
+//
+// Sessions are counted by their place in metas and records in one table, not
+// in maps keyed by ordinal and offset: a common word holds postings in most of
+// a 19,000-session store, and the maps of maps they went into were the larger
+// part of what a recall spent ranking.
 type relevanceAcc struct {
-	m         Manifest
-	inProject map[uint32]SessionMeta
-	br        *bucketReader
+	m  Manifest
+	br *bucketReader
+	// metas are the sessions being ranked, and place is each ordinal's index
+	// there, -1 for a session that is not.
+	metas []SessionMeta
+	place []int32
 	// A real bucket read error (a corrupt or unreadable postings file) must not
 	// pass as "the term is absent": that silently drops the term from the
 	// ranking. Remember the first one and hand it back so the caller triggers
@@ -19,7 +27,43 @@ type relevanceAcc struct {
 	readErr   error
 	totalDocs float64
 	idfOf     map[string]float64
-	score     map[uint32]float64
+	// sess is what each session collected, by place, and credited the places
+	// that collected anything, in the order they first did.
+	sess     []sessionCredit
+	credited []int32
+	// Coverage counted over the terms that identify something on their own,
+	// kept alongside so the choice between the two can be made once the whole
+	// query has been read rather than term by term.
+	identifyingTerms int
+	// The rarest term the question holds; see sessionCredit.bestMatched.
+	queryBest float64
+	// msgs is every record of the sessions being ranked that a term matched or
+	// that is a tool record, and msgAt finds one by its offset.
+	msgs  []messageCredit
+	msgAt map[int64]int32
+	// Counted over the whole store, not the sessions being ranked: the guard
+	// that reads it is telling a typo from a real word, and a word another
+	// project uses is a real word. Counted over the project, a question with
+	// one word this project shares and two it never said read as one known
+	// word among typos, and the project-scoped recall answered nothing (#4789).
+	termsKnown int
+
+	// Scratch for one term at a time, left zeroed between terms.
+	dfCount   []int32 // by ordinal: the term's capped message count there
+	dfTouched []uint32
+	termTF    []int32 // by place: the term's postings there
+	keyTF     []int32 // by place: one sub-token's postings there
+	inHit     []bool  // by place
+	spoken    []bool  // by place
+	hits      []int32
+	keyHits   []int32
+	termOffs  []placeOff
+	keyOffs   []placeOff
+}
+
+// sessionCredit is what one session collected over the query's terms.
+type sessionCredit struct {
+	score float64
 	// focus is the same scoring restricted to the words that distinguish. A
 	// question asked in plain speech carries filler that is a content word to
 	// the index — "how many bikes do I own" ranks on many, bikes and own — and
@@ -27,65 +71,94 @@ type relevanceAcc struct {
 	// whole query it loses to sessions carrying more of the filler; scored on
 	// the rare part alone it wins. Neither view is right on its own, so both are
 	// kept and the better place of the two is used, at a price.
-	focus        map[uint32]float64
-	matchedTerms map[uint32]int
-	// Coverage counted over the terms that identify something on their own,
-	// kept alongside so the choice between the two can be made once the whole
-	// query has been read rather than term by term.
-	identifyingTerms   int
-	matchedIdentifying map[uint32]int
+	focus float64
 	// The rarest term this session matched, against the rarest the question
 	// holds. A short question skips the store check entirely — "a short
 	// question is all subject" — so `decide saltmarsh` asked where saltmarsh
 	// has never been said fired on `decide`, and nothing downstream could tell
 	// the subject from the verb beside it (#3351).
-	bestMatched map[uint32]float64
-	queryBest   float64
-	strongTerms map[uint32]int
-	anyTerms    map[uint32]int
-	// perMessage tracks how many distinct terms hit each message (record
-	// offset) of a session: co-occurrence inside one message is a far
-	// stronger topical signal than terms scattered across a long session.
-	perMessage map[uint32]map[int64]int
-	// msgIDF accumulates the idf mass of distinct terms per message, so a
-	// session can be ranked by its best single message rather than by the
-	// total it collects across thousands of them.
-	msgIDF map[uint32]map[int64]float64
-	// toolOff marks the matched records that are tool records rather than
-	// speech, so their credit can be weighed at toolMatchWeight below.
-	toolOff map[int64]bool
-	// Counted over the whole store, not the sessions being ranked: the guard
-	// that reads it is telling a typo from a real word, and a word another
-	// project uses is a real word. Counted over the project, a question with
-	// one word this project shares and two it never said read as one known
-	// word among typos, and the project-scoped recall answered nothing (#4789).
-	termsKnown int
+	bestMatched float64
+	// The terms it matched: informative ones, identifying ones, any, strong.
+	matched, identifying, any, strong int32
+	// messages is how many of its records matched a term. bestTerms and
+	// bestIDF are, over those records, the most distinct terms one of them
+	// holds and the most idf mass one of them collects (scoreSession).
+	messages  int32
+	bestTerms float64
+	bestIDF   float64
+	credited  bool
 }
 
-func newRelevanceAcc(m Manifest, inProject map[uint32]SessionMeta, br *bucketReader) *relevanceAcc {
+// messageCredit is one matched record. Co-occurrence inside one message is a
+// far stronger topical signal than terms scattered across a long session, so
+// each record counts the distinct terms that hit it and the idf mass they
+// carry: a session can then be ranked by its best single message rather than
+// by the total it collects across thousands of them.
+type messageCredit struct {
+	off   int64
+	place int32
+	terms int32
+	idf   float64
+	// tool marks a tool record rather than speech, so its credit can be
+	// weighed at toolMatchWeight below.
+	tool bool
+	// matched says a term credited the record; a tool record can be listed
+	// before any does.
+	matched bool
+}
+
+// placeOff is one record of a session being ranked.
+type placeOff struct {
+	place int32
+	off   int64
+}
+
+func newRelevanceAcc(m Manifest, metas []SessionMeta, place []int32, br *bucketReader) *relevanceAcc {
+	n := len(metas)
 	return &relevanceAcc{
-		m:                  m,
-		inProject:          inProject,
-		br:                 br,
-		totalDocs:          float64(countedDocs(m)) + 1,
-		idfOf:              map[string]float64{},
-		score:              map[uint32]float64{},
-		focus:              map[uint32]float64{},
-		matchedTerms:       map[uint32]int{},
-		matchedIdentifying: map[uint32]int{},
-		bestMatched:        map[uint32]float64{},
-		strongTerms:        map[uint32]int{},
-		anyTerms:           map[uint32]int{},
-		perMessage:         map[uint32]map[int64]int{},
-		msgIDF:             map[uint32]map[int64]float64{},
-		toolOff:            map[int64]bool{},
+		m:         m,
+		br:        br,
+		metas:     metas,
+		place:     place,
+		totalDocs: float64(countedDocs(m)) + 1,
+		idfOf:     map[string]float64{},
+		sess:      make([]sessionCredit, n),
+		msgAt:     map[int64]int32{},
+		dfCount:   make([]int32, len(place)),
+		termTF:    make([]int32, n),
+		keyTF:     make([]int32, n),
+		inHit:     make([]bool, n),
+		spoken:    make([]bool, n),
 	}
 }
 
-// termHits is where one query term matched among the sessions being ranked.
+// placeOf is where the session with ordinal sid is among those being ranked,
+// -1 when it is not one of them.
+func (a *relevanceAcc) placeOf(sid uint32) int32 {
+	if int(sid) < len(a.place) {
+		return a.place[sid]
+	}
+	return -1
+}
+
+// message is the index in msgs of the record at off, listed on first use.
+func (a *relevanceAcc) message(off int64, place int32) int32 {
+	if i, ok := a.msgAt[off]; ok {
+		return i
+	}
+	i := int32(len(a.msgs)) //nolint:gosec // a store's records are far below 2^31
+	a.msgs = append(a.msgs, messageCredit{off: off, place: place})
+	a.msgAt[off] = i
+	return i
+}
+
+// termHits is where one query term matched among the sessions being ranked:
+// the places it hit, each once, with its postings there in termTF.
 type termHits struct {
-	hit map[uint32]bool
-	tf  map[uint32]int
+	hits []int32
+	// offs is the records that give the term's message credit, in the
+	// sessions being ranked. Places outside hits are skipped.
+	offs []placeOff
 	// minDF is in capped messages, minSess in whole sessions. Neither
 	// unit is right alone: sessions call a subject word common because
 	// the marathons everything lives in all mention it, and capped
@@ -96,7 +169,6 @@ type termHits struct {
 	// filler.
 	minDF   int
 	minSess int
-	offs    map[uint32]map[int64]bool
 }
 
 // noteQuerySubject raises that mark for a word that names something. df is
@@ -140,6 +212,10 @@ func (a *relevanceAcc) addTerm(term string) {
 	if ok {
 		a.scoreTerm(term, th)
 	}
+	for _, p := range th.hits {
+		a.termTF[p] = 0
+	}
+	a.hits = th.hits[:0]
 }
 
 // stemKeys is a single-token term's key with its stem forms as OR-variants,
@@ -176,7 +252,7 @@ func (a *relevanceAcc) stemKeys(term string, keys []string) []string {
 		// session that answers it because of sessions in other projects.
 		if exact, err := a.br.postings(orKeys[0]); err == nil && len(exact) > 0 {
 			for _, pp := range exact {
-				if _, ok := a.inProject[pp.Sid]; ok {
+				if a.placeOf(pp.Sid) >= 0 {
 					orKeys = orKeys[:1]
 					break
 				}
@@ -195,97 +271,182 @@ func (a *relevanceAcc) postings(key string) ([]posting, error) {
 	return posts, err
 }
 
-// notePostings counts posts into df over the whole store, and into hit, tf
-// and offs for the sessions being ranked.
-func (a *relevanceAcc) notePostings(posts []posting, df map[uint32]map[int64]bool, hit map[uint32]bool, tf map[uint32]int, offs map[uint32]map[int64]bool) {
-	for _, pp := range posts {
-		noteDF(df, pp.Sid, pp.Off)
-		if _, ok := a.inProject[pp.Sid]; ok {
-			if pp.Tool {
-				a.toolOff[pp.Off] = true
-			}
-			hit[pp.Sid] = true
-			tf[pp.Sid]++
-			oo := offs[pp.Sid]
-			if oo == nil {
-				oo = map[int64]bool{}
-				offs[pp.Sid] = oo
-			}
-			oo[pp.Off] = true
+// countDF is the document frequency of posts over the whole store, in the unit
+// the corpus size uses (messages, at most dfMessageCap a session) and in
+// sessions. Document frequency in sessions, not postings: one
+// marathon session repeating a term 300 times must not make it common. posts
+// hold each record once.
+func (a *relevanceAcc) countDF(posts []posting) (df, sessions int) {
+	for _, p := range posts {
+		if int(p.Sid) >= len(a.dfCount) {
+			a.dfCount = append(a.dfCount, make([]int32, int(p.Sid)+1-len(a.dfCount))...)
 		}
+		c := a.dfCount[p.Sid]
+		if c == 0 {
+			sessions++
+			a.dfTouched = append(a.dfTouched, p.Sid)
+		}
+		if c < dfMessageCap {
+			a.dfCount[p.Sid] = c + 1
+			df++
+		}
+	}
+	for _, sid := range a.dfTouched {
+		a.dfCount[sid] = 0
+	}
+	a.dfTouched = a.dfTouched[:0]
+	return df, sessions
+}
+
+// noteTool marks a tool posting of a session being ranked.
+func (a *relevanceAcc) noteTool(p posting, place int32) {
+	if p.Tool {
+		a.msgs[a.message(p.Off, place)].tool = true
 	}
 }
 
 // unionForms matches a term on any of its stem forms.
 func (a *relevanceAcc) unionForms(term string, orKeys []string) (termHits, bool) {
 	// OR path: union postings across the term's stem forms.
-	df := map[uint32]map[int64]bool{}
-	th := termHits{
-		hit:     map[uint32]bool{},
-		tf:      map[uint32]int{},
-		offs:    map[uint32]map[int64]bool{},
-		minDF:   -1,
-		minSess: -1,
-	}
+	th := termHits{hits: a.hits[:0], minDF: -1, minSess: -1}
+	var lists [][]posting
 	for _, key := range orKeys {
 		posts, err := a.postings(key)
 		if err != nil || len(posts) == 0 {
 			continue
 		}
-		a.notePostings(posts, df, th.hit, th.tf, th.offs)
+		lists = append(lists, posts)
+		for _, pp := range posts {
+			place := a.placeOf(pp.Sid)
+			if place < 0 {
+				continue
+			}
+			a.noteTool(pp, place)
+			if a.termTF[place] == 0 {
+				th.hits = append(th.hits, place)
+			}
+			a.termTF[place]++
+		}
 	}
-	if len(df) > 0 {
+	// Two forms can share a record; it counts once.
+	union := unionPostings(lists)
+	df, sessions := a.countDF(union)
+	offs := a.termOffs[:0]
+	for _, pp := range union {
+		if place := a.placeOf(pp.Sid); place >= 0 {
+			offs = append(offs, placeOff{place, pp.Off})
+		}
+	}
+	a.termOffs, th.offs = offs, offs
+	if sessions > 0 {
 		a.termsKnown++
 	}
-	if len(th.hit) == 0 {
-		a.noteQuerySubject(term, len(df))
+	if len(th.hits) == 0 {
+		a.noteQuerySubject(term, sessions)
 		return th, false
 	}
-	th.minDF, th.minSess = countDF(df), len(df)
+	th.minDF, th.minSess = df, sessions
 	return th, true
+}
+
+// unionPostings is the postings of every list, each sorted by offset, in one
+// list sorted by offset with each record once.
+func unionPostings(lists [][]posting) []posting {
+	switch len(lists) {
+	case 0:
+		return nil
+	case 1:
+		return lists[0]
+	}
+	out := lists[0]
+	for _, l := range lists[1:] {
+		merged := make([]posting, 0, len(out)+len(l))
+		i, j := 0, 0
+		for i < len(out) && j < len(l) {
+			switch {
+			case out[i].Off < l[j].Off:
+				merged = append(merged, out[i])
+				i++
+			case out[i].Off > l[j].Off:
+				merged = append(merged, l[j])
+				j++
+			default:
+				merged = append(merged, out[i])
+				i++
+				j++
+			}
+		}
+		merged = append(merged, out[i:]...)
+		merged = append(merged, l[j:]...)
+		out = merged
+	}
+	return out
 }
 
 // everyKey matches a term only where every one of its sub-tokens is present.
 func (a *relevanceAcc) everyKey(term string, keys []string) (termHits, bool) {
-	th := termHits{minDF: -1, minSess: -1}
+	th := termHits{hits: a.hits[:0], minDF: -1, minSess: -1}
 	missed := false
 	// Every sub-token of the term is somewhere in the store.
 	inStore := true
+	first := true
 	for _, key := range keys {
 		posts, err := a.postings(key)
 		if err != nil || len(posts) == 0 {
 			missed, inStore = true, false
 			break
 		}
-		// Document frequency in sessions, not postings: one marathon
-		// session repeating a term 300 times must not make it common.
-		df := map[uint32]map[int64]bool{}
-		keyHit := map[uint32]bool{}
-		keyTF := map[uint32]int{}
-		keyOffs := map[uint32]map[int64]bool{}
-		a.notePostings(posts, df, keyHit, keyTF, keyOffs)
-		if th.hit == nil {
-			th.hit, th.tf = keyHit, keyTF
-		} else {
-			for ord := range th.hit {
-				if !keyHit[ord] {
-					delete(th.hit, ord)
-					delete(th.tf, ord)
-				} else if keyTF[ord] < th.tf[ord] {
-					th.tf[ord] = keyTF[ord]
-				}
+		df, sessions := a.countDF(posts)
+		keyHits, keyOffs := a.keyHits[:0], a.keyOffs[:0]
+		for _, pp := range posts {
+			place := a.placeOf(pp.Sid)
+			if place < 0 {
+				continue
 			}
+			a.noteTool(pp, place)
+			if a.keyTF[place] == 0 {
+				keyHits = append(keyHits, place)
+			}
+			a.keyTF[place]++
+			keyOffs = append(keyOffs, placeOff{place, pp.Off})
 		}
+		if first {
+			first = false
+			for _, p := range keyHits {
+				a.termTF[p] = a.keyTF[p]
+			}
+			th.hits = append(th.hits, keyHits...)
+		} else {
+			kept := th.hits[:0]
+			for _, p := range th.hits {
+				switch {
+				case a.keyTF[p] == 0:
+					a.termTF[p] = 0
+					continue
+				case a.keyTF[p] < a.termTF[p]:
+					a.termTF[p] = a.keyTF[p]
+				}
+				kept = append(kept, p)
+			}
+			th.hits = kept
+		}
+		for _, p := range keyHits {
+			a.keyTF[p] = 0
+		}
+		a.keyHits = keyHits[:0]
 		// Message credit follows the rarest sub-token — the one whose df
 		// sets the term's idf. A union would let a message containing
 		// only a common sub-token ("index" of "pkg/index") collect the
 		// full term mass, and best-message ranking amplifies that.
-		if th.minDF == -1 || countDF(df) < th.minDF {
-			th.minDF, th.minSess = countDF(df), len(df)
-			th.offs = keyOffs
+		if th.minDF == -1 || df < th.minDF {
+			th.minDF, th.minSess = df, sessions
+			a.termOffs, a.keyOffs = keyOffs, a.termOffs[:0]
+			th.offs = a.termOffs
+		} else {
+			a.keyOffs = keyOffs[:0]
 		}
-		if len(th.hit) == 0 {
-			a.noteQuerySubject(term, len(df))
+		if len(th.hits) == 0 {
+			a.noteQuerySubject(term, sessions)
 			missed = true
 			break
 		}
@@ -293,7 +454,7 @@ func (a *relevanceAcc) everyKey(term string, keys []string) (termHits, bool) {
 	if inStore {
 		a.termsKnown++
 	}
-	if missed || len(th.hit) == 0 {
+	if missed || len(th.hits) == 0 {
 		return th, false
 	}
 	return th, true
@@ -301,7 +462,7 @@ func (a *relevanceAcc) everyKey(term string, keys []string) (termHits, bool) {
 
 // scoreTerm weighs a matched term and credits it to every session it hit.
 func (a *relevanceAcc) scoreTerm(term string, th termHits) {
-	hit, tf, offs, minDF, minSess := th.hit, th.tf, th.offs, th.minDF, th.minSess
+	minDF, minSess := th.minDF, th.minSess
 	// Two verdicts on how rare the term is, and they answer two different
 	// questions. Whether the term is worth speaking up about is the rarer
 	// of the two: sessions alone call a subject word common because the
@@ -349,101 +510,109 @@ func (a *relevanceAcc) scoreTerm(term string, th termHits) {
 	// The question's own high-water mark: its rarest word is what it is
 	// about, whether or not any session here holds it (#3351).
 	a.noteQuerySubject(term, minSess)
-	for ord := range hit {
-		mm := a.perMessage[ord]
-		if mm == nil {
-			mm = map[int64]int{}
-			a.perMessage[ord] = mm
+	for _, p := range th.hits {
+		a.inHit[p] = true
+	}
+	for _, po := range th.offs {
+		if !a.inHit[po.place] {
+			continue
 		}
-		mi := a.msgIDF[ord]
-		if mi == nil {
-			mi = map[int64]float64{}
-			a.msgIDF[ord] = mi
+		msg := &a.msgs[a.message(po.off, po.place)]
+		if !msg.matched {
+			msg.matched = true
+			a.sess[po.place].messages++
 		}
-		for off := range offs[ord] {
-			mm[off]++
-			mi[off] += rank
+		msg.terms++
+		msg.idf += rank
+		// A term the session only ever held in tool records was not said
+		// by anyone there; it sat in a file it read or a command's output.
+		if !msg.tool {
+			a.spoken[po.place] = true
 		}
 	}
-	for ord := range hit {
+	for _, p := range th.hits {
+		s := &a.sess[p]
 		// Saturated term frequency: repeated mentions add confidence
 		// with quickly diminishing returns, so a marathon session cannot
 		// bury a focused one through sheer repetition.
-		weighted := rank * (1 + 0.25*math.Log2(float64(tf[ord])))
-		// A term the session only ever held in tool records was not said
-		// by anyone there; it sat in a file it read or a command's output.
-		spoken := false
-		for off := range offs[ord] {
-			if !a.toolOff[off] {
-				spoken = true
-				break
-			}
-		}
-		if !spoken {
+		weighted := rank * (1 + 0.25*math.Log2(float64(a.termTF[p])))
+		if !a.spoken[p] {
 			weighted *= toolMatchWeight
 		}
-		a.score[ord] += weighted
-		if informative {
-			a.focus[ord] += weighted
+		a.inHit[p], a.spoken[p] = false, false
+		if !s.credited {
+			s.credited = true
+			a.credited = append(a.credited, p)
 		}
-		a.anyTerms[ord]++
+		s.score += weighted
 		if informative {
-			a.matchedTerms[ord]++
+			s.focus += weighted
+			s.matched++
 		}
+		s.any++
 		if identifying {
-			a.matchedIdentifying[ord]++
+			s.identifying++
 		}
-		if rank > a.bestMatched[ord] {
-			a.bestMatched[ord] = rank
+		if rank > s.bestMatched {
+			s.bestMatched = rank
 		}
 		if strong {
-			a.strongTerms[ord]++
+			s.strong++
+		}
+	}
+}
+
+// bestMessages sets each session's best message, once every term is in.
+//
+// A tool record co-occurs at toolMatchWeight: a 50 KB file read or JSON dump
+// holds most words of any question, so one such record made a session that
+// only ever read files look like it answered (#4780). Speech is weighed
+// exactly as before.
+func (a *relevanceAcc) bestMessages() {
+	for i := range a.msgs {
+		msg := &a.msgs[i]
+		if !msg.matched {
+			continue
+		}
+		s := &a.sess[msg.place]
+		kk, v := float64(msg.terms), msg.idf
+		if msg.tool {
+			kk = 1 + (kk-1)*toolMatchWeight
+			v *= toolMatchWeight
+		}
+		if kk > s.bestTerms {
+			s.bestTerms = kk
+		}
+		if v > s.bestIDF {
+			s.bestIDF = v
 		}
 	}
 }
 
 // scoreSession turns one session's collected credit into its final score.
-func (a *relevanceAcc) scoreSession(ord uint32, sc float64, long bool, sumWords, nWords float64) relevanceScored {
+func (a *relevanceAcc) scoreSession(p int32, long bool, sumWords, nWords float64) relevanceScored {
+	s := &a.sess[p]
+	meta := a.metas[p]
+	sc := s.score
 	// Same-message co-occurrence bonus: the best single message covering
 	// k distinct query terms scales the session's score. A session where
 	// one message answers the whole question outranks one that merely
 	// mentions every word somewhere.
-	//
-	// A tool record co-occurs at toolMatchWeight: a 50 KB file read or
-	// JSON dump holds most words of any question, so one such record
-	// made a session that only ever read files look like it answered
-	// (#4780). Speech is weighed exactly as before.
-	best := 1.0
-	for off, k := range a.perMessage[ord] {
-		kk := float64(k)
-		if a.toolOff[off] {
-			kk = 1 + (kk-1)*toolMatchWeight
-		}
-		if kk > best {
-			best = kk
-		}
-	}
+	best := max(1.0, s.bestTerms)
 	// A focused message beats diffuse mentions: the session's score is
 	// its best message's idf mass (scaled by same-message co-occurrence),
 	// with the session-wide total only as a dampened tail. Without this,
 	// one marathon session that brushes every query word somewhere
 	// outranks the short session that actually answers.
-	var bestMsg float64
-	for off, v := range a.msgIDF[ord] {
-		if a.toolOff[off] {
-			v *= toolMatchWeight
-		}
-		if v > bestMsg {
-			bestMsg = v
-		}
-	}
+	bestMsg := s.bestIDF
 	coocc := 1 + 0.2*(best-1)
 	if !long {
 		sc = bestMsg*coocc + 0.25*(sc-bestMsg)
 	}
 	// Coverage: distinct informative terms beat repetition.
-	if a.matchedTerms[ord] > 1 {
-		sc *= 1 + 0.15*float64(a.matchedTerms[ord]-1)
+	covered := coverageCount(s.matched, s.identifying, a.identifyingTerms)
+	if covered > 1 {
+		sc *= 1 + 0.15*float64(covered-1)
 	}
 	// How much of the session the match is. A marathon that brushes the
 	// question across hundreds of turns and a short session where the
@@ -451,8 +620,8 @@ func (a *relevanceAcc) scoreSession(ord uint32, sc float64, long bool, sumWords,
 	// questions phrased from real PR titles the marathon took the top
 	// place twice (#3214). Counted in messages, which is the unit the
 	// match is already measured in.
-	if counted := a.inProject[ord].Counted; counted > 0 {
-		share := float64(len(a.perMessage[ord])) / float64(counted)
+	if counted := meta.Counted; counted > 0 {
+		share := float64(s.messages) / float64(counted)
 		if share > 1 {
 			share = 1
 		}
@@ -466,19 +635,19 @@ func (a *relevanceAcc) scoreSession(ord uint32, sc float64, long bool, sumWords,
 	// subject through a neighbouring word, and demanding the exact one cost
 	// the reworded arm nine of twenty (#3351).
 	named := 0
-	if a.queryBest <= 0 || a.bestMatched[ord] >= a.queryBest*subjectShare {
+	if a.queryBest <= 0 || s.bestMatched >= a.queryBest*subjectShare {
 		named = 1
 	}
 	if long && sumWords > 0 {
 		// A session indexed before lengths were counted is taken as
 		// average: neither paid nor charged for a length nobody knows.
-		w := float64(a.inProject[ord].Words)
+		w := float64(meta.Words)
 		if w == 0 {
 			w = sumWords / nWords
 		}
 		norm := 1 - longQueryLengthB + longQueryLengthB*w/(sumWords/nWords)
 		sc /= norm
-		a.focus[ord] /= norm
+		s.focus /= norm
 	}
-	return relevanceScored{a.inProject[ord], sc, a.matchedTerms[ord], a.anyTerms[ord], a.strongTerms[ord], named, a.focus[ord]}
+	return relevanceScored{meta, sc, int(covered), int(s.any), int(s.strong), named, s.focus}
 }

@@ -20,7 +20,7 @@ func TestAFocusedWinTakesABetterPlaceButPaysForIt(t *testing.T) {
 	}
 	ranked[11].focus = 100
 
-	out := fuseFocus(ranked)
+	out := fuseRanked(ranked)
 	at := -1
 	for i, r := range out {
 		if r.meta.ID == ranked[11].meta.ID {
@@ -55,7 +55,7 @@ func TestTheFocusedViewCannotTakeTheFront(t *testing.T) {
 	}
 	ranked[5].focus = 100
 
-	out := fuseFocus(ranked)
+	out := fuseRanked(ranked)
 	if out[0].meta.ID != "a" {
 		t.Errorf("the front of the ranking changed hands to %q", out[0].meta.ID)
 	}
@@ -72,7 +72,7 @@ func TestAgreementLeavesTheOrderAlone(t *testing.T) {
 			focus: float64(8 - i),
 		}
 	}
-	for i, r := range fuseFocus(ranked) {
+	for i, r := range fuseRanked(ranked) {
 		if r.meta.ID != ranked[i].meta.ID {
 			t.Fatalf("agreeing views still reordered the ranking at %d: %q, want %q", i, r.meta.ID, ranked[i].meta.ID)
 		}
@@ -98,8 +98,17 @@ func TestFusionDampsASingleTopPlace(t *testing.T) {
 			focus: focus[i],
 		}
 	}
-	if out := fuseFocus(ranked); out[0].meta.ID != "b" {
+	if out := fuseRanked(ranked); out[0].meta.ID != "b" {
 		t.Errorf("front went to %q, want b: second on both views beats first on one",
 			out[0].meta.ID)
 	}
+}
+
+// fuseRanked is fuseFocus over rows already in ranked order.
+func fuseRanked(ranked []relevanceScored) []relevanceScored {
+	order := make([]int32, len(ranked))
+	for i := range order {
+		order[i] = int32(i)
+	}
+	return fuseFocus(ranked, order)
 }
