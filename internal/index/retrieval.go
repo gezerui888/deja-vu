@@ -1,6 +1,7 @@
 package index
 
 import (
+	"cmp"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -614,7 +615,7 @@ func relevanceResult(ss []model.Session, matched int, idf map[string]float64) Se
 	}
 }
 
-// coverageCounts picks which count of matched terms coverage is paid on.
+// coverageCount picks which count of matched terms coverage is paid on.
 //
 // When something in the query identifies on its own, coverage is counted over
 // those terms alone: the ordinary words a question is phrased with stop earning
@@ -625,7 +626,7 @@ func relevanceResult(ss []model.Session, matched int, idf map[string]float64) Se
 // Measured: LoCoMo 69.8% to 70.2% R@1 and MRR .768 to .770; on LongMemEval-S
 // the preference questions, which are ordinary words around one that matters,
 // go 33.3% to 36.7% hit@1 with the total unmoved.
-func coverageCounts(all, identifying map[uint32]int, identifyingTerms int) map[uint32]int {
+func coverageCount(all, identifying int32, identifyingTerms int) int32 {
 	if identifyingTerms == 0 {
 		return all
 	}
@@ -1098,25 +1099,20 @@ const rrfK = 60
 // So both are kept and each session takes its better place, the focused one at
 // a price. Ordering by the fused place rather than by a blended score keeps the
 // two views from having to be on the same scale, which they are not.
-func fuseFocus(ranked []relevanceScored) []relevanceScored {
-	if len(ranked) < 2 {
-		return ranked
+func fuseFocus(scored []relevanceScored, order []int32) []relevanceScored {
+	if len(order) < 2 {
+		out := make([]relevanceScored, len(order))
+		for i, idx := range order {
+			out[i] = scored[idx]
+		}
+		return out
 	}
-	order := make([]int, len(ranked))
-	for i := range order {
-		order[i] = i
-	}
-	sort.SliceStable(order, func(a, b int) bool { return ranked[order[a]].focus > ranked[order[b]].focus })
-	byFocus := make([]int, len(ranked))
-	for place, idx := range order {
+	// The rows stay where they are; places are kept by index.
+	byFocusOrder := slices.Clone(order)
+	slices.SortStableFunc(byFocusOrder, func(a, b int32) int { return cmp.Compare(scored[b].focus, scored[a].focus) })
+	byFocus := make([]int, len(scored))
+	for place, idx := range byFocusOrder {
 		byFocus[idx] = place
-	}
-	// The place travels with the row. Sorting the rows while indexing a
-	// parallel slice by the comparator's arguments reads the place of whatever
-	// has been swapped into that position, not of the row being compared.
-	type placed struct {
-		row   relevanceScored
-		score float64
 	}
 	// Reciprocal rank fusion instead of "the better of the two places, with the
 	// focused view paying three of them". RRF sums 1/(k+rank) over the
@@ -1125,14 +1121,15 @@ func fuseFocus(ranked []relevanceScored) []relevanceScored {
 	// normalised scores it is both more accurate and steadier (Bruch et al.,
 	// "An Analysis of Fusion Functions for Hybrid Retrieval", 2022). What it
 	// replaces was two numbers picked by hand.
-	rows := make([]placed, len(ranked))
-	for i, r := range ranked {
-		rows[i] = placed{r, 1/float64(rrfK+i+1) + 1/float64(rrfK+byFocus[i]+1)}
+	fused := make([]float64, len(scored))
+	for i, idx := range order {
+		fused[idx] = 1/float64(rrfK+i+1) + 1/float64(rrfK+byFocus[idx]+1)
 	}
-	sort.SliceStable(rows, func(a, b int) bool { return rows[a].score > rows[b].score })
-	out := make([]relevanceScored, len(rows))
-	for i, r := range rows {
-		out[i] = r.row
+	final := slices.Clone(order)
+	slices.SortStableFunc(final, func(a, b int32) int { return cmp.Compare(fused[b], fused[a]) })
+	out := make([]relevanceScored, len(final))
+	for i, idx := range final {
+		out[i] = scored[idx]
 	}
 	return out
 }
@@ -1282,30 +1279,36 @@ func ProjectInScope(project, want string) bool { return projectInScope(project, 
 // any-frequency term counts, how many query terms the corpus knows at all,
 // and that pre-truncation total.
 func relevantMetasCounts(dir string, m Manifest, projects, terms []string, n int, keep func(SessionMeta) bool) (relevanceRanking, error) {
-	inProject := map[uint32]SessionMeta{}
+	metas := make([]SessionMeta, 0, len(m.Sessions))
 	scope := newProjectScope(projects...)
+	maxOrd := -1
 	for _, meta := range m.Sessions {
 		if keep != nil && !keep(meta) {
 			continue
 		}
-		if len(projects) == 0 { // empty scope = whole index
-			inProject[meta.Ord] = meta
-			continue
-		}
-		if scope.has(meta.Project) {
-			inProject[meta.Ord] = meta
+		// An empty scope is the whole index.
+		if len(projects) == 0 || scope.has(meta.Project) {
+			metas = append(metas, meta)
+			maxOrd = max(maxOrd, int(meta.Ord))
 		}
 	}
-	if len(inProject) == 0 {
+	if len(metas) == 0 {
 		return relevanceRanking{}, nil
+	}
+	place := make([]int32, maxOrd+1)
+	for i := range place {
+		place[i] = -1
+	}
+	for i, meta := range metas {
+		place[meta.Ord] = int32(i)
 	}
 	br := newBucketReader(dir)
 	defer br.close()
-	a := newRelevanceAcc(m, inProject, br)
+	a := newRelevanceAcc(m, metas, place, br)
 	for _, term := range terms {
 		a.addTerm(term)
 	}
-	a.matchedTerms = coverageCounts(a.matchedTerms, a.matchedIdentifying, a.identifyingTerms)
+	a.bestMessages()
 	// A query this long is a pasted document — an issue, a log, a spec — and
 	// ranking it is finding the documents most like it, so a session's score
 	// pays for its length the way BM25 does and is summed over the session
@@ -1313,71 +1316,77 @@ func relevantMetasCounts(dir string, m Manifest, projects, terms []string, n int
 	long := isLongQuery(terms)
 	var sumWords, nWords float64
 	if long {
-		for _, meta := range inProject {
+		for _, meta := range metas {
 			if meta.Words > 0 {
 				sumWords += float64(meta.Words)
 				nWords++
 			}
 		}
 	}
-	ranked := make([]relevanceScored, 0, len(a.score))
-	for ord, sc := range a.score {
-		if sc <= 0 {
+	scored := make([]relevanceScored, 0, len(a.credited))
+	for _, p := range a.credited {
+		if a.sess[p].score <= 0 {
 			continue
 		}
-		ranked = append(ranked, a.scoreSession(ord, sc, long, sumWords, nWords))
+		scored = append(scored, a.scoreSession(p, long, sumWords, nWords))
 	}
-	if len(ranked) == 0 {
+	if len(scored) == 0 {
 		return relevanceRanking{termsKnown: a.termsKnown}, a.readErr
 	}
-	sort.Slice(ranked, func(i, j int) bool {
-		if ranked[i].score != ranked[j].score {
-			return ranked[i].score > ranked[j].score
+	// Sorted by index: a row is a whole SessionMeta, and moving rows was most
+	// of what the sort cost.
+	order := make([]int32, len(scored))
+	for i := range order {
+		order[i] = int32(i)
+	}
+	slices.SortFunc(order, func(i, j int32) int {
+		x, y := &scored[i], &scored[j]
+		if x.score != y.score {
+			return cmp.Compare(y.score, x.score)
 		}
-		if !ranked[i].meta.Updated.Equal(ranked[j].meta.Updated) {
-			return ranked[i].meta.Updated.After(ranked[j].meta.Updated)
+		if !x.meta.Updated.Equal(y.meta.Updated) {
+			return y.meta.Updated.Compare(x.meta.Updated)
 		}
-		// Total order even on full ties: map iteration must never decide
-		// what the user sees first.
-		return ranked[i].meta.ID < ranked[j].meta.ID
+		// Total order even on full ties: the order sessions were collected
+		// in must never decide what the user sees first.
+		return strings.Compare(x.meta.ID, y.meta.ID)
 	})
-	ranked = fuseFocus(ranked)
+	ranked := fuseFocus(scored, order)
 	// Counted here, one line above the truncation, because this is the last
 	// moment the pool exists.
 	matchedTotal := len(ranked)
 	if n > 0 && len(ranked) > n {
 		ranked = ranked[:n]
 	}
-	metas := make([]SessionMeta, 0, len(ranked))
+	out := make([]SessionMeta, 0, len(ranked))
 	matched := make([]int, 0, len(ranked))
 	anyMatched := make([]int, 0, len(ranked))
 	strong := make([]int, 0, len(ranked))
 	naming := make([]int, 0, len(ranked))
 	scores := make([]float64, 0, len(ranked))
+	kept := make([]bool, len(metas))
 	for _, r := range ranked {
-		metas = append(metas, r.meta)
+		out = append(out, r.meta)
 		scores = append(scores, r.score)
 		matched = append(matched, r.matched)
 		anyMatched = append(anyMatched, r.any)
 		strong = append(strong, r.strong)
 		naming = append(naming, r.naming)
+		kept[place[r.meta.Ord]] = true
 	}
 	// The records that matched, for the sessions that survived the window.
-	// perMessage is keyed by offset because the per-message signals need it;
-	// handing it on is what lets the caller read those records instead of
-	// every record of every candidate (#3491).
+	// The per-message signals need them by offset; handing them on is what
+	// lets the caller read those records instead of every record of every
+	// candidate (#3491).
 	offsets := make(map[uint32][]int64, len(ranked))
-	for _, r := range ranked {
-		if mm := a.perMessage[r.meta.Ord]; len(mm) > 0 {
-			offs := make([]int64, 0, len(mm))
-			for off := range mm {
-				offs = append(offs, off)
-			}
-			offsets[r.meta.Ord] = offs
+	for _, msg := range a.msgs {
+		if msg.matched && kept[msg.place] {
+			ord := metas[msg.place].Ord
+			offsets[ord] = append(offsets[ord], msg.off)
 		}
 	}
 	return relevanceRanking{
-		metas:       metas,
+		metas:       out,
 		informative: matched,
 		any:         anyMatched,
 		strong:      strong,
@@ -5101,29 +5110,6 @@ func countedDocs(m Manifest) int {
 			c = 1
 		}
 		n += min(c, dfMessageCap)
-	}
-	return n
-}
-
-// noteDF records that a term appeared in one more message of a session, up to
-// the cap.
-func noteDF(df map[uint32]map[int64]bool, sid uint32, off int64) {
-	seen := df[sid]
-	if seen == nil {
-		seen = map[int64]bool{}
-		df[sid] = seen
-	}
-	if len(seen) < dfMessageCap {
-		seen[off] = true
-	}
-}
-
-// countDF is the document frequency in the same unit the corpus size uses:
-// messages, with each session contributing at most dfMessageCap of them.
-func countDF(df map[uint32]map[int64]bool) int {
-	n := 0
-	for _, seen := range df {
-		n += len(seen)
 	}
 	return n
 }

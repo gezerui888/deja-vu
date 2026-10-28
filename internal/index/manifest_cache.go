@@ -71,18 +71,23 @@ func readManifestCached(dir string) (Manifest, error) {
 }
 
 // cacheManifest makes m the cached manifest of dir, as read from the files fi
-// and si describe.
+// and si describe. Another generation of the index, so the bucket directories
+// cached for the last one go with it.
 func cacheManifest(dir string, fi, si os.FileInfo, m Manifest) {
 	manifestCache.mu.Lock()
 	manifestCache.dir, manifestCache.fi, manifestCache.sessions = dir, fi, si
 	manifestCache.m, manifestCache.ok = m, true
 	manifestCache.views = &metaViews{sessions: m.Sessions}
 	manifestCache.mu.Unlock()
+	dropBucketDirs(dir)
 }
 
 // moveManifestCache follows a directory renamed from tmp to dir: its files
-// are the same files, so a manifest cached for tmp is dir's now.
+// are the same files, so a manifest cached for tmp is dir's now. Bucket
+// directories are cached by path, and both paths now name other files.
 func moveManifestCache(tmp, dir string) {
+	dropBucketDirs(tmp)
+	dropBucketDirs(dir)
 	manifestCache.mu.Lock()
 	defer manifestCache.mu.Unlock()
 	switch manifestCache.dir {
@@ -141,6 +146,7 @@ func Stamp(dir string) string {
 // without touching sessions.gob; a subsequent index writer must not reuse an
 // in-memory Manifest from before that atomic replacement.
 func invalidateManifestCache(dir string) {
+	dropBucketDirs(dir)
 	manifestCache.mu.Lock()
 	defer manifestCache.mu.Unlock()
 	if manifestCache.dir == dir {
